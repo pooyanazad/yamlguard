@@ -1,4 +1,4 @@
 yamllint==1.38.0
-checkov==3.3.22
+checkov==3.3.29
 colorama==0.4.6
 PyYAML==6.0.3
