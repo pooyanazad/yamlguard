@@ -22,6 +22,8 @@ import yaml
 from yamlguard.models import (
     Severity,
     ToolAvailability,
+    ToolExecution,
+    ToolStatus,
     ValidationIssue,
     ValidationResult,
 )
@@ -30,6 +32,10 @@ from yamlguard.output import print_colored
 # ─────────────────────────────────────────────────────────────────────────────
 PYTHON_EXECUTABLE = sys.executable
 LARGE_FILE_WARNING_THRESHOLD = 1024 * 1024
+
+# Issues carrying this rule mean "the tool did not finish", not "the file has a
+# problem". Severity alone cannot express that distinction.
+OPERATIONAL_ERROR_RULE = "operational-error"
 
 # Operational errors quote a short excerpt of tool output. Keep it bounded and
 # strip anything that looks like a credential so reports stay safe to publish.
@@ -230,6 +236,7 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                     tool="yamllint",
                     severity=Severity.HIGH,
                     message="yamllint is not installed or not available in the Python environment.",
+                    rule=OPERATIONAL_ERROR_RULE,
                     file_path=file_path,
                 )
             )
@@ -245,6 +252,7 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                         f"yamllint execution failed with exit code {result.returncode}"
                         f"{_diagnostic_suffix(result)}"
                     ),
+                    rule=OPERATIONAL_ERROR_RULE,
                     file_path=file_path,
                 )
             )
@@ -284,6 +292,7 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                 tool="yamllint",
                 severity=Severity.HIGH,
                 message=f"yamllint execution timed out after {timeout} seconds.",
+                rule=OPERATIONAL_ERROR_RULE,
                 file_path=file_path,
             )
         )
@@ -293,6 +302,7 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                 tool="yamllint",
                 severity=Severity.HIGH,
                 message=f"yamllint execution failed: {e!s}",
+                rule=OPERATIONAL_ERROR_RULE,
                 file_path=file_path,
             )
         )
@@ -307,6 +317,7 @@ def _checkov_operational_error(file_path: str, reason: str) -> ValidationIssue:
         tool="checkov",
         severity=Severity.HIGH,
         message=f"checkov execution failed: {reason}",
+        rule=OPERATIONAL_ERROR_RULE,
         file_path=file_path,
     )
 
@@ -439,6 +450,7 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                 tool="checkov",
                 severity=Severity.HIGH,
                 message=f"checkov execution timed out after {timeout} seconds.",
+                rule=OPERATIONAL_ERROR_RULE,
                 file_path=file_path,
             )
         )
@@ -448,6 +460,7 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                 tool="checkov",
                 severity=Severity.HIGH,
                 message=f"checkov execution failed: {e!s}",
+                rule=OPERATIONAL_ERROR_RULE,
                 file_path=file_path,
             )
         )
@@ -485,7 +498,16 @@ def validate_yaml_file(
         warn_if_large_file(file_path)
 
     all_issues: list[ValidationIssue] = []
+    tool_status: list[ToolExecution] = []
     syntax_valid = True
+
+    def _record(tool: str, issues: list[ValidationIssue]) -> None:
+        """Record whether a tool completed, or failed with the reason it gave."""
+        failure = next((i for i in issues if i.rule == OPERATIONAL_ERROR_RULE), None)
+        if failure is None:
+            tool_status.append(ToolExecution(tool, ToolStatus.COMPLETED))
+        else:
+            tool_status.append(ToolExecution(tool, ToolStatus.FAILED, failure.message))
 
     # 1. Check YAML syntax
     _say("\n📋 Checking YAML syntax...", Severity.INFO)
@@ -502,25 +524,37 @@ def validate_yaml_file(
     _say("\n🔧 Running yamllint...", Severity.INFO)
     yamllint_issues = run_yamllint(file_path, timeout=timeout)
     all_issues.extend(yamllint_issues)
+    _record("yamllint", yamllint_issues)
 
-    if yamllint_issues:
+    if any(i.rule == OPERATIONAL_ERROR_RULE for i in yamllint_issues):
+        _say("❌ yamllint did not complete", Severity.HIGH)
+    elif yamllint_issues:
         _say(f"⚠️  Found {len(yamllint_issues)} linting issues", Severity.MEDIUM)
     else:
         _say("✅ No linting issues found", Severity.INFO)
 
     # 3. Run checkov (if available)
     if no_security:
+        tool_status.append(
+            ToolExecution("checkov", ToolStatus.SKIPPED, "security checks disabled")
+        )
         _say("\n⚠️  Security checks skipped (--no-security)", Severity.MEDIUM)
     elif tools.checkov:
         _say("\n🔒 Running security checks (checkov)...", Severity.INFO)
         checkov_issues = run_checkov(file_path, timeout=timeout)
         all_issues.extend(checkov_issues)
+        _record("checkov", checkov_issues)
 
-        if checkov_issues:
+        if any(i.rule == OPERATIONAL_ERROR_RULE for i in checkov_issues):
+            _say("❌ checkov did not complete", Severity.HIGH)
+        elif checkov_issues:
             _say(f"🚨 Found {len(checkov_issues)} security issues", Severity.HIGH)
         else:
             _say("✅ No security issues found", Severity.INFO)
     else:
+        tool_status.append(
+            ToolExecution("checkov", ToolStatus.SKIPPED, "checkov not available")
+        )
         _say("\n⚠️  Security checks skipped (checkov not available)", Severity.MEDIUM)
 
     # Generate summary
@@ -538,11 +572,13 @@ def validate_yaml_file(
         syntax_valid=syntax_valid,
         issues=all_issues,
         summary=summary,
+        tool_status=tool_status,
     )
 
 
 __all__ = [
     "LARGE_FILE_WARNING_THRESHOLD",
+    "OPERATIONAL_ERROR_RULE",
     "run_checkov",
     "run_yamllint",
     "validate_yaml_file",

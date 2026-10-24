@@ -28,6 +28,7 @@ from yamlguard.output import (
     print_junit_result,
     print_sarif_result,
     print_summary_table,
+    print_tool_status,
 )
 from yamlguard.validators import validate_yaml_file
 
@@ -262,6 +263,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     results = []
     has_critical_high = False
+    has_operational_failure = False
     total_issues = 0
 
     for yaml_file in yaml_files:
@@ -276,11 +278,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
         if not json_mode:
             print_issues(result.issues)
+            print_tool_status(result.tool_status)
             print_summary_table(result.summary)
 
         critical_high = result.summary["critical"] + result.summary["high"]
         if critical_high > 0:
             has_critical_high = True
+        if result.has_operational_failure:
+            has_operational_failure = True
         total_issues += result.summary["total"]
 
     # ── Machine-readable output (single emit at the end) ──────────────────────
@@ -324,6 +329,16 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Final status
     if not json_mode:
         print_colored("\n" + "=" * 60, Severity.INFO)
+    if has_operational_failure:
+        # A tool that did not finish means the scan is incomplete, so it can
+        # never be reported as a success regardless of the findings it produced.
+        if not json_mode:
+            print_colored(
+                "💥 Validation incomplete! A validator failed to run.",
+                Severity.CRITICAL,
+                bold=True,
+            )
+        sys.exit(1)
     if total_issues == 0:
         if not json_mode:
             print_colored(

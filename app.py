@@ -20,6 +20,8 @@ from yamlguard.models import (  # noqa: F401
     SEVERITY_COLORS,
     Severity,
     ToolAvailability,
+    ToolExecution,
+    ToolStatus,
     ValidationIssue,
     ValidationResult,
 )
@@ -32,6 +34,7 @@ from yamlguard.output import (  # noqa: F401
     print_junit_result,
     print_sarif_result,
     print_summary_table,
+    print_tool_status,
     result_to_json,
     results_to_junit,
     results_to_sarif,

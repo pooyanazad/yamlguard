@@ -94,6 +94,21 @@ def print_issues(issues: list[ValidationIssue]) -> None:
                 )
 
 
+def print_tool_status(tool_status: list) -> None:  # list[ToolExecution]
+    """Print how each tool ran, so a skipped or failed check is never invisible."""
+    if not tool_status:
+        return
+
+    print_colored("\n🧰 Tool status:", Severity.INFO, bold=True)
+    for execution in tool_status:
+        icon = {"completed": "✅", "skipped": "⏭️", "failed": "❌"}.get(
+            execution.status.value, "•"
+        )
+        detail = f" ({execution.reason})" if execution.reason else ""
+        severity = Severity.HIGH if execution.failed else Severity.INFO
+        print_colored(f"   {icon} {execution.tool}: {execution.status.value}{detail}", severity)
+
+
 def print_summary_table(summary: dict[str, int]) -> None:
     """Print a colour-coded summary table of severity counts."""
     print_colored("\n📊 Summary Report:", Severity.INFO, bold=True)
@@ -266,16 +281,35 @@ def results_to_junit(results: list) -> str:  # list[ValidationResult]
     One <testsuite> per file, one <testcase> per issue. CRITICAL/HIGH issues are
     reported as <failure> (matching the CLI exit code); MEDIUM/LOW/INFO are
     reported as <skipped> so they stay visible without failing the build.
-    A file with no issues gets a single passing testcase.
+    A tool that failed to run is reported as an <error>, which is distinct from
+    a finding and always fails the build. A file with no issues gets a single
+    passing testcase.
     """
     root = ET.Element("testsuites", name="yamlguard")
-    total_tests = total_failures = total_skipped = 0
+    total_tests = total_failures = total_skipped = total_errors = 0
 
     for result in results:
         suite = ET.SubElement(root, "testsuite", name=result.file_path)
-        failures = skipped = 0
+        failures = skipped = errors = 0
 
-        if not result.issues:
+        for execution in getattr(result, "tool_status", []):
+            if not execution.failed:
+                continue
+            errors += 1
+            case = ET.SubElement(
+                suite,
+                "testcase",
+                classname=result.file_path,
+                name=f"{execution.tool}/execution",
+            )
+            node = ET.SubElement(
+                case,
+                "error",
+                {"message": execution.reason or "tool did not complete", "type": "operational"},
+            )
+            node.text = f"[OPERATIONAL] {execution.reason or 'tool did not complete'}"
+
+        if not result.issues and not errors:
             ET.SubElement(suite, "testcase", classname=result.file_path, name="validation")
 
         for issue in result.issues:
@@ -299,18 +333,19 @@ def results_to_junit(results: list) -> str:  # list[ValidationResult]
             if location:
                 node.text += f" ({location})"
 
-        count = len(result.issues) or 1
+        count = len(result.issues) + errors or 1
         suite.set("tests", str(count))
         suite.set("failures", str(failures))
-        suite.set("errors", "0")
+        suite.set("errors", str(errors))
         suite.set("skipped", str(skipped))
         total_tests += count
         total_failures += failures
         total_skipped += skipped
+        total_errors += errors
 
     root.set("tests", str(total_tests))
     root.set("failures", str(total_failures))
-    root.set("errors", "0")
+    root.set("errors", str(total_errors))
     root.set("skipped", str(total_skipped))
 
     ET.indent(root)
@@ -326,6 +361,7 @@ __all__ = [
     "print_colored",
     "print_issues",
     "print_summary_table",
+    "print_tool_status",
     "print_json_result",
     "print_junit_result",
     "print_sarif_result",

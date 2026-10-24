@@ -4,6 +4,8 @@ yamlguard.models
 Dataclasses and enums shared across the package.
 
   Severity         — CRITICAL / HIGH / MEDIUM / LOW / INFO
+  ToolStatus       — COMPLETED / SKIPPED / FAILED
+  ToolExecution    — how one tool ran for one file
   ValidationIssue  — one problem found in a YAML file
   ValidationResult — full result for one file
   ToolAvailability — which external tools are present
@@ -11,7 +13,7 @@ Dataclasses and enums shared across the package.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 # ===== IMPORTS & DEPENDENCIES =====
@@ -42,6 +44,14 @@ class Severity(Enum):
     INFO = "INFO"
 
 
+class ToolStatus(Enum):
+    """Whether a tool actually produced a usable result for a file."""
+
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
 SEVERITY_COLORS: dict[Severity, str] = {
     Severity.CRITICAL: Fore.RED + Style.BRIGHT,
     Severity.HIGH: Fore.RED,
@@ -64,11 +74,31 @@ class ValidationIssue:
 
 
 @dataclass
+class ToolExecution:
+    """How one tool ran for one file, independent of any finding severity."""
+
+    tool: str
+    status: ToolStatus
+    reason: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.status is ToolStatus.FAILED
+
+
+@dataclass
 class ValidationResult:
     file_path: str
     syntax_valid: bool
     issues: list[ValidationIssue]
     summary: dict[str, int]
+    # Defaults keep existing callers that build ValidationResult positionally working.
+    tool_status: list[ToolExecution] = field(default_factory=list)
+
+    @property
+    def has_operational_failure(self) -> bool:
+        """True when any tool failed to complete, regardless of finding severity."""
+        return any(execution.failed for execution in self.tool_status)
 
 
 @dataclass
@@ -83,6 +113,8 @@ __all__ = [
     "SEVERITY_COLORS",
     "Severity",
     "ToolAvailability",
+    "ToolExecution",
+    "ToolStatus",
     "ValidationIssue",
     "ValidationResult",
 ]
