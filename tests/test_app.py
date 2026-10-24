@@ -474,15 +474,80 @@ class TestRunCheckov:
         assert issues[0].line == 5
 
     @patch("subprocess.run")
-    def test_checkov_malformed_json_handled(self, mock_run):
-        """Checkov returning malformed output creates a parse failure issue without crashing."""
+    def test_checkov_malformed_json_is_operational_error(self, mock_run):
+        """Malformed JSON must fail the scan, not become a MEDIUM finding."""
         mock_run.return_value = subprocess.CompletedProcess(
             args=["checkov"], returncode=1, stdout="not valid json {{{", stderr=""
         )
         issues = run_checkov("test.yaml", timeout=300)
 
         assert len(issues) == 1
-        assert "Failed to parse checkov output" in issues[0].message
+        assert issues[0].severity == Severity.HIGH
+        assert "could not parse JSON report" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_checkov_nonzero_exit_with_empty_output_is_operational_error(self, mock_run):
+        """A crash with no report cannot look like a clean scan."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"], returncode=2, stdout="", stderr="checkov: bad argument"
+        )
+        issues = run_checkov("test.yaml", timeout=300)
+
+        assert len(issues) == 1
+        assert issues[0].severity == Severity.HIGH
+        assert "exit code 2" in issues[0].message
+        assert "bad argument" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_checkov_success_exit_with_empty_output_is_operational_error(self, mock_run):
+        """Exit 0 with no report still means the scan produced nothing usable."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"], returncode=0, stdout="", stderr=""
+        )
+        issues = run_checkov("test.yaml", timeout=300)
+
+        assert len(issues) == 1
+        assert issues[0].severity == Severity.HIGH
+        assert "no report produced" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_checkov_unexpected_json_structure_is_operational_error(self, mock_run):
+        """Valid JSON that is not a Checkov report is an operational error."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"], returncode=0, stdout=json.dumps({"unexpected": True}), stderr=""
+        )
+        issues = run_checkov("test.yaml", timeout=300)
+
+        assert len(issues) == 1
+        assert issues[0].severity == Severity.HIGH
+        assert "unexpected report structure" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_checkov_clean_report_yields_no_issues(self, mock_run):
+        """A report with no failed checks is a genuine clean result."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"],
+            returncode=0,
+            stdout=json.dumps({"results": {"failed_checks": []}}),
+            stderr="",
+        )
+        assert run_checkov("test.yaml", timeout=300) == []
+
+    @patch("subprocess.run")
+    def test_checkov_diagnostic_is_bounded_and_redacted(self, mock_run):
+        """Crash diagnostics are truncated and credential-looking values masked."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"],
+            returncode=2,
+            stdout="",
+            stderr="GITHUB_TOKEN=ghp_secretvalue " + "y" * 500,
+        )
+        issues = run_checkov("test.yaml", timeout=300)
+
+        assert len(issues) == 1
+        assert "ghp_secretvalue" not in issues[0].message
+        assert "GITHUB_TOKEN=***" in issues[0].message
+        assert len(issues[0].message) < 300
 
     def test_trailing_spaces_detected(self, tmp_yaml):
         path = tmp_yaml("key: value   \n")

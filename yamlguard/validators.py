@@ -301,8 +301,44 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def _checkov_operational_error(file_path: str, reason: str) -> ValidationIssue:
+    """Build a HIGH-severity issue describing a Checkov run that did not complete."""
+    return ValidationIssue(
+        tool="checkov",
+        severity=Severity.HIGH,
+        message=f"checkov execution failed: {reason}",
+        file_path=file_path,
+    )
+
+
+def _parse_checkov_report(data: object) -> list[dict] | None:
+    """Return the report dicts in a Checkov payload, or None if the shape is unexpected."""
+    if isinstance(data, dict):
+        reports = [data]
+    elif isinstance(data, list):
+        reports = data
+    else:
+        return None
+
+    # An empty list is Checkov's "no applicable framework" answer, not a failure.
+    if not reports:
+        return []
+    if not all(isinstance(report, dict) for report in reports):
+        return None
+    # A usable report carries a "results" object; anything else is not a report.
+    if not any(isinstance(report.get("results"), dict) for report in reports):
+        return None
+    return reports
+
+
 def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
-    """Run checkov and parse results."""
+    """Run checkov and parse results.
+
+    Checkov exits 0 when nothing failed and 1 when checks failed; both are
+    normal. Any other exit, empty output, unparseable JSON, or an unexpected
+    payload shape is an operational error reported at HIGH severity, so an
+    incomplete scan can never be mistaken for a clean one.
+    """
     issues: list[ValidationIssue] = []
 
     try:
@@ -322,56 +358,77 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
             check=False,
         )
 
-        if result.stdout.strip():
-            try:
-                data = json.loads(result.stdout)
-                reports = (
-                    data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        if result.returncode not in (0, 1):
+            issues.append(
+                _checkov_operational_error(
+                    file_path,
+                    f"exit code {result.returncode}{_diagnostic_suffix(result)}",
                 )
+            )
+            return issues
 
-                for report in reports:
-                    if not isinstance(report, dict):
-                        continue
-                    results = report.get("results")
-                    if not isinstance(results, dict):
-                        continue
-                    for check in results.get("failed_checks", []) or []:
-                        if not isinstance(check, dict):
-                            continue
-                        severity = Severity.HIGH
-                        if check.get("severity"):
-                            severity_map = {
-                                "CRITICAL": Severity.CRITICAL,
-                                "HIGH": Severity.HIGH,
-                                "MEDIUM": Severity.MEDIUM,
-                                "LOW": Severity.LOW,
-                            }
-                            severity = severity_map.get(
-                                str(check.get("severity", "HIGH")).upper(),
-                                Severity.HIGH,
-                            )
+        if not result.stdout.strip():
+            issues.append(
+                _checkov_operational_error(
+                    file_path,
+                    f"no report produced (exit code {result.returncode})"
+                    f"{_diagnostic_suffix(result)}",
+                )
+            )
+            return issues
 
-                        line_num = None
-                        if check.get("file_line_range") and len(check["file_line_range"]) > 0:
-                            line_num = check["file_line_range"][0]
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            issues.append(
+                _checkov_operational_error(
+                    file_path,
+                    f"could not parse JSON report ({e.msg} at line {e.lineno})",
+                )
+            )
+            return issues
 
-                        issues.append(
-                            ValidationIssue(
-                                tool="checkov",
-                                severity=severity,
-                                message=check.get("check_name", "Security check failed"),
-                                line=line_num,
-                                rule=check.get("check_id", ""),
-                                file_path=file_path,
-                            )
-                        )
+        reports = _parse_checkov_report(data)
+        if reports is None:
+            issues.append(
+                _checkov_operational_error(
+                    file_path,
+                    f"unexpected report structure ({type(data).__name__})",
+                )
+            )
+            return issues
 
-            except (json.JSONDecodeError, AttributeError, TypeError, KeyError) as e:
+        for report in reports:
+            results = report.get("results")
+            if not isinstance(results, dict):
+                continue
+            for check in results.get("failed_checks", []) or []:
+                if not isinstance(check, dict):
+                    continue
+                severity = Severity.HIGH
+                if check.get("severity"):
+                    severity_map = {
+                        "CRITICAL": Severity.CRITICAL,
+                        "HIGH": Severity.HIGH,
+                        "MEDIUM": Severity.MEDIUM,
+                        "LOW": Severity.LOW,
+                    }
+                    severity = severity_map.get(
+                        str(check.get("severity", "HIGH")).upper(),
+                        Severity.HIGH,
+                    )
+
+                line_num = None
+                if check.get("file_line_range") and len(check["file_line_range"]) > 0:
+                    line_num = check["file_line_range"][0]
+
                 issues.append(
                     ValidationIssue(
                         tool="checkov",
-                        severity=Severity.MEDIUM,
-                        message=f"Failed to parse checkov output: {e!s}",
+                        severity=severity,
+                        message=check.get("check_name", "Security check failed"),
+                        line=line_num,
+                        rule=check.get("check_id", ""),
                         file_path=file_path,
                     )
                 )
