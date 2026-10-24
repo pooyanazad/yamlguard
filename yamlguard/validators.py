@@ -177,7 +177,18 @@ def validate_yaml_syntax(file_path: str) -> list[ValidationIssue]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
-    """Run yamllint and parse results."""
+    """Run yamllint and parse results.
+
+    Return codes from yamllint:
+      0 — no problems found
+      1 — one or more lint issues found (normal operation)
+      2 — configuration error or crash
+
+    We treat 0 and 1 as normal lint-result exits and parse stdout for findings.
+    Any non-zero exit without usable findings (including crashes, configuration
+    failures, or exit code >= 2) is emitted as an explicit operational error
+    with HIGH severity so it cannot yield a clean result.
+    """
     issues: list[ValidationIssue] = []
     pattern = re.compile(r"^(.+?):(\d+):(\d+): \[([^\]]+)\] (.+?)(?: \(([^)]+)\))?$")
 
@@ -228,6 +239,20 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                             file_path=file_path,
                         )
                     )
+
+        # Non-zero exit without usable findings represents a crash or configuration failure
+        if result.returncode != 0 and not issues:
+            _MAX_DIAG = 200
+            stderr_excerpt = result.stderr.strip()[:_MAX_DIAG]
+            diag = f": {stderr_excerpt}" if stderr_excerpt else ""
+            issues.append(
+                ValidationIssue(
+                    tool="yamllint",
+                    severity=Severity.HIGH,
+                    message=f"yamllint execution failed with exit code {result.returncode}{diag}",
+                    file_path=file_path,
+                )
+            )
 
     except subprocess.TimeoutExpired:
         issues.append(

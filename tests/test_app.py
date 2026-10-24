@@ -309,6 +309,46 @@ class TestRunYamllint:
         assert issues[0].severity == Severity.HIGH
         assert "timed out after 300 seconds" in issues[0].message
 
+    @patch("subprocess.run")
+    def test_yamllint_crash_nonzero_exit_without_findings_emits_high_severity(self, mock_run):
+        """Simulated crash (rc!=0 without findings) cannot yield clean result, emits HIGH operational error."""
+        mock_result = type(
+            "MockResult",
+            (),
+            {
+                "stdout": "",
+                "stderr": "Fatal Python error: Segmentation fault",
+                "returncode": 139,
+            },
+        )()
+        mock_run.return_value = mock_result
+        issues = run_yamllint("fake_path.yaml")
+
+        assert len(issues) == 1
+        assert issues[0].severity == Severity.HIGH
+        assert "execution failed with exit code 139" in issues[0].message
+        assert "Segmentation fault" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_yamllint_config_failure_emits_operational_error(self, mock_run):
+        """Configuration failure (rc=2 without findings) emits operational error with diagnostic."""
+        mock_result = type(
+            "MockResult",
+            (),
+            {
+                "stdout": "",
+                "stderr": "yamllint: error: invalid config file",
+                "returncode": 2,
+            },
+        )()
+        mock_run.return_value = mock_result
+        issues = run_yamllint("fake_path.yaml")
+
+        assert len(issues) == 1
+        assert issues[0].severity == Severity.HIGH
+        assert "execution failed with exit code 2" in issues[0].message
+        assert "invalid config file" in issues[0].message
+
 
 class TestRunCheckov:
     @patch("subprocess.run")
