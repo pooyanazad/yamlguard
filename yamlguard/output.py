@@ -101,9 +101,7 @@ def print_tool_status(tool_status: list) -> None:  # list[ToolExecution]
 
     print_colored("\n🧰 Tool status:", Severity.INFO, bold=True)
     for execution in tool_status:
-        icon = {"completed": "✅", "skipped": "⏭️", "failed": "❌"}.get(
-            execution.status.value, "•"
-        )
+        icon = {"completed": "✅", "skipped": "⏭️", "failed": "❌"}.get(execution.status.value, "•")
         detail = f" ({execution.reason})" if execution.reason else ""
         severity = Severity.HIGH if execution.failed else Severity.INFO
         print_colored(f"   {icon} {execution.tool}: {execution.status.value}{detail}", severity)

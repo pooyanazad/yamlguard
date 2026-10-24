@@ -336,8 +336,12 @@ def _parse_checkov_report(data: object) -> list[dict] | None:
         return []
     if not all(isinstance(report, dict) for report in reports):
         return None
-    # A usable report carries a "results" object; anything else is not a report.
-    if not any(isinstance(report.get("results"), dict) for report in reports):
+    # A usable report carries a "results" object, or is checkov's summary-only
+    # form (counts, no "results") returned when no framework applies to the file.
+    if not any(
+        isinstance(report.get("results"), dict) or isinstance(report.get("failed"), int)
+        for report in reports
+    ):
         return None
     return reports
 
@@ -346,7 +350,7 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
     """Run checkov and parse results.
 
     Checkov exits 0 when nothing failed and 1 when checks failed; both are
-    normal. Any other exit, empty output, unparseable JSON, or an unexpected
+    normal. Any other exit, empty output on exit 1, unparseable JSON, or an unexpected
     payload shape is an operational error reported at HIGH severity, so an
     incomplete scan can never be mistaken for a clean one.
     """
@@ -379,6 +383,8 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
             return issues
 
         if not result.stdout.strip():
+            if result.returncode == 0:
+                return issues  # exit 0 and no report: nothing applicable to scan
             issues.append(
                 _checkov_operational_error(
                     file_path,
@@ -416,18 +422,16 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
             for check in results.get("failed_checks", []) or []:
                 if not isinstance(check, dict):
                     continue
-                severity = Severity.HIGH
-                if check.get("severity"):
-                    severity_map = {
-                        "CRITICAL": Severity.CRITICAL,
-                        "HIGH": Severity.HIGH,
-                        "MEDIUM": Severity.MEDIUM,
-                        "LOW": Severity.LOW,
-                    }
-                    severity = severity_map.get(
-                        str(check.get("severity", "HIGH")).upper(),
-                        Severity.HIGH,
-                    )
+                severity_map = {
+                    "CRITICAL": Severity.CRITICAL,
+                    "HIGH": Severity.HIGH,
+                    "MEDIUM": Severity.MEDIUM,
+                    "LOW": Severity.LOW,
+                }
+                severity = severity_map.get(
+                    str(check.get("severity") or "HIGH").upper(),
+                    Severity.HIGH,
+                )
 
                 line_num = None
                 if check.get("file_line_range") and len(check["file_line_range"]) > 0:
@@ -469,7 +473,15 @@ def run_checkov(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def validate_yaml_file(
+def _tool_execution(tool: str, issues: list[ValidationIssue]) -> ToolExecution:
+    """Derive how a tool ran from the issues it returned."""
+    failure = next((i for i in issues if i.rule == OPERATIONAL_ERROR_RULE), None)
+    if failure is None:
+        return ToolExecution(tool, ToolStatus.COMPLETED)
+    return ToolExecution(tool, ToolStatus.FAILED, failure.message)
+
+
+def validate_yaml_file(  # noqa: PLR0915
     file_path: str,
     tools: ToolAvailability | None = None,
     timeout: int = 300,
@@ -501,14 +513,6 @@ def validate_yaml_file(
     tool_status: list[ToolExecution] = []
     syntax_valid = True
 
-    def _record(tool: str, issues: list[ValidationIssue]) -> None:
-        """Record whether a tool completed, or failed with the reason it gave."""
-        failure = next((i for i in issues if i.rule == OPERATIONAL_ERROR_RULE), None)
-        if failure is None:
-            tool_status.append(ToolExecution(tool, ToolStatus.COMPLETED))
-        else:
-            tool_status.append(ToolExecution(tool, ToolStatus.FAILED, failure.message))
-
     # 1. Check YAML syntax
     _say("\n📋 Checking YAML syntax...", Severity.INFO)
     syntax_issues = validate_yaml_syntax(file_path)
@@ -524,9 +528,9 @@ def validate_yaml_file(
     _say("\n🔧 Running yamllint...", Severity.INFO)
     yamllint_issues = run_yamllint(file_path, timeout=timeout)
     all_issues.extend(yamllint_issues)
-    _record("yamllint", yamllint_issues)
+    tool_status.append(_tool_execution("yamllint", yamllint_issues))
 
-    if any(i.rule == OPERATIONAL_ERROR_RULE for i in yamllint_issues):
+    if tool_status[-1].failed:
         _say("❌ yamllint did not complete", Severity.HIGH)
     elif yamllint_issues:
         _say(f"⚠️  Found {len(yamllint_issues)} linting issues", Severity.MEDIUM)
@@ -534,28 +538,23 @@ def validate_yaml_file(
         _say("✅ No linting issues found", Severity.INFO)
 
     # 3. Run checkov (if available)
-    if no_security:
-        tool_status.append(
-            ToolExecution("checkov", ToolStatus.SKIPPED, "security checks disabled")
-        )
-        _say("\n⚠️  Security checks skipped (--no-security)", Severity.MEDIUM)
-    elif tools.checkov:
+    if no_security or not tools.checkov:
+        skipped_by = "--no-security" if no_security else "checkov not available"
+        reason = "security checks disabled" if no_security else skipped_by
+        tool_status.append(ToolExecution("checkov", ToolStatus.SKIPPED, reason))
+        _say(f"\n⚠️  Security checks skipped ({skipped_by})", Severity.MEDIUM)
+    else:
         _say("\n🔒 Running security checks (checkov)...", Severity.INFO)
         checkov_issues = run_checkov(file_path, timeout=timeout)
         all_issues.extend(checkov_issues)
-        _record("checkov", checkov_issues)
+        tool_status.append(_tool_execution("checkov", checkov_issues))
 
-        if any(i.rule == OPERATIONAL_ERROR_RULE for i in checkov_issues):
+        if tool_status[-1].failed:
             _say("❌ checkov did not complete", Severity.HIGH)
         elif checkov_issues:
             _say(f"🚨 Found {len(checkov_issues)} security issues", Severity.HIGH)
         else:
             _say("✅ No security issues found", Severity.INFO)
-    else:
-        tool_status.append(
-            ToolExecution("checkov", ToolStatus.SKIPPED, "checkov not available")
-        )
-        _say("\n⚠️  Security checks skipped (checkov not available)", Severity.MEDIUM)
 
     # Generate summary
     summary = {

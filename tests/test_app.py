@@ -499,16 +499,33 @@ class TestRunCheckov:
         assert "bad argument" in issues[0].message
 
     @patch("subprocess.run")
-    def test_checkov_success_exit_with_empty_output_is_operational_error(self, mock_run):
-        """Exit 0 with no report still means the scan produced nothing usable."""
+    def test_checkov_success_exit_with_empty_output_is_clean(self, mock_run):
+        """Exit 0 with no report means nothing applicable, not a failure."""
         mock_run.return_value = subprocess.CompletedProcess(
             args=["checkov"], returncode=0, stdout="", stderr=""
+        )
+        assert run_checkov("test.yaml", timeout=300) == []
+
+    @patch("subprocess.run")
+    def test_checkov_failure_exit_with_empty_output_is_operational_error(self, mock_run):
+        """Exit 1 means findings were expected; no report is a failed scan."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"], returncode=1, stdout="", stderr=""
         )
         issues = run_checkov("test.yaml", timeout=300)
 
         assert len(issues) == 1
         assert issues[0].severity == Severity.HIGH
         assert "no report produced" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_checkov_summary_only_report_is_clean(self, mock_run):
+        """Checkov's counts-only output for non-applicable YAML is not an error."""
+        summary = {"passed": 0, "failed": 0, "skipped": 0, "resource_count": 0}
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["checkov"], returncode=0, stdout=json.dumps(summary), stderr=""
+        )
+        assert run_checkov("test.yaml", timeout=300) == []
 
     @patch("subprocess.run")
     def test_checkov_unexpected_json_structure_is_operational_error(self, mock_run):
@@ -621,7 +638,8 @@ class TestValidateYamlFile:
         assert result.summary["critical"] == 0
 
     def test_clean_file_total_zero(self, clean_file):
-        result = validate_yaml_file(clean_file)
+        # no_security keeps this independent of whether checkov is installed
+        result = validate_yaml_file(clean_file, no_security=True)
         # Clean file should have no issues at all
         assert result.summary["total"] == 0
 

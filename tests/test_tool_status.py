@@ -61,7 +61,8 @@ class TestToolStatusModel:
 
 
 class TestValidateYamlFileStatus:
-    def test_clean_run_reports_completed_tools(self, clean_file):
+    def test_clean_run_reports_completed_tools(self, clean_file, monkeypatch):
+        monkeypatch.setattr("yamlguard.validators.run_checkov", lambda *a, **k: [])
         result = validate_yaml_file(clean_file, ToolAvailability(), quiet=True)
         statuses = {e.tool: e.status for e in result.tool_status}
         assert statuses["yamllint"] is ToolStatus.COMPLETED
@@ -142,7 +143,7 @@ class TestCliOperationalFailure:
 
         monkeypatch.setattr(sys, "argv", ["yamlguard", *argv])
         monkeypatch.setattr(cli, "validate_yaml_file", lambda *a, **k: result)
-        monkeypatch.setattr(cli, "check_dependencies", lambda: ToolAvailability())
+        monkeypatch.setattr(cli, "check_dependencies", ToolAvailability)
         with pytest.raises(SystemExit) as excinfo:
             cli.main()
         return excinfo.value.code
