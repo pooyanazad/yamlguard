@@ -349,6 +349,46 @@ class TestRunYamllint:
         assert "execution failed with exit code 2" in issues[0].message
         assert "invalid config file" in issues[0].message
 
+    @patch("subprocess.run")
+    def test_yamllint_crash_with_stdout_noise_is_not_parsed_as_findings(self, mock_run):
+        """A crash that prints to stdout must not be downgraded to a MEDIUM finding."""
+        mock_result = type(
+            "MockResult",
+            (),
+            {
+                "stdout": "Traceback (most recent call last):\n  boom",
+                "stderr": "",
+                "returncode": 2,
+            },
+        )()
+        mock_run.return_value = mock_result
+        issues = run_yamllint("fake_path.yaml")
+
+        assert len(issues) == 1
+        assert issues[0].severity == Severity.HIGH
+        assert "execution failed with exit code 2" in issues[0].message
+        assert "Traceback" in issues[0].message
+
+    @patch("subprocess.run")
+    def test_yamllint_diagnostic_is_bounded_and_redacted(self, mock_run):
+        """Long stderr is truncated and credential-looking values are masked."""
+        mock_result = type(
+            "MockResult",
+            (),
+            {
+                "stdout": "",
+                "stderr": "AWS_SECRET_ACCESS_KEY=supersecretvalue " + "x" * 500,
+                "returncode": 2,
+            },
+        )()
+        mock_run.return_value = mock_result
+        issues = run_yamllint("fake_path.yaml")
+
+        assert len(issues) == 1
+        assert "supersecretvalue" not in issues[0].message
+        assert "AWS_SECRET_ACCESS_KEY=***" in issues[0].message
+        assert len(issues[0].message) < 300
+
 
 class TestRunCheckov:
     @patch("subprocess.run")

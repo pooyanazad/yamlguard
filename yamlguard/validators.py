@@ -31,6 +31,29 @@ from yamlguard.output import print_colored
 PYTHON_EXECUTABLE = sys.executable
 LARGE_FILE_WARNING_THRESHOLD = 1024 * 1024
 
+# Operational errors quote a short excerpt of tool output. Keep it bounded and
+# strip anything that looks like a credential so reports stay safe to publish.
+_MAX_DIAGNOSTIC_CHARS = 200
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|CREDENTIAL)[A-Z0-9_]*)"
+    r"\s*[=:]\s*\S+"
+)
+
+
+def _bounded_diagnostic(text: str, limit: int = _MAX_DIAGNOSTIC_CHARS) -> str:
+    """Return a single-line, length-bounded, secret-redacted excerpt of tool output."""
+    collapsed = " ".join((text or "").split())
+    collapsed = _SECRET_PATTERN.sub(r"\1=***", collapsed)
+    if len(collapsed) > limit:
+        collapsed = collapsed[: limit - 3] + "..."
+    return collapsed
+
+
+def _diagnostic_suffix(result: subprocess.CompletedProcess) -> str:
+    """Build a ``": <excerpt>"`` suffix from a finished subprocess, or ``""``."""
+    excerpt = _bounded_diagnostic(result.stderr) or _bounded_diagnostic(result.stdout)
+    return f": {excerpt}" if excerpt else ""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def warn_if_large_file(file_path: str) -> None:
@@ -182,12 +205,12 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
     Return codes from yamllint:
       0 — no problems found
       1 — one or more lint issues found (normal operation)
-      2 — configuration error or crash
+      anything else — configuration error or crash
 
-    We treat 0 and 1 as normal lint-result exits and parse stdout for findings.
-    Any non-zero exit without usable findings (including crashes, configuration
-    failures, or exit code >= 2) is emitted as an explicit operational error
-    with HIGH severity so it cannot yield a clean result.
+    Only 0 and 1 are normal lint-result exits, so only those are parsed for
+    findings. Any other exit is an operational error: it is reported with HIGH
+    severity and its stdout is never interpreted as lint output, so a crash
+    that happens to print something cannot masquerade as a clean scan.
     """
     issues: list[ValidationIssue] = []
     pattern = re.compile(r"^(.+?):(\d+):(\d+): \[([^\]]+)\] (.+?)(?: \(([^)]+)\))?$")
@@ -207,6 +230,21 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                     tool="yamllint",
                     severity=Severity.HIGH,
                     message="yamllint is not installed or not available in the Python environment.",
+                    file_path=file_path,
+                )
+            )
+            return issues
+
+        # Only 0 (clean) and 1 (findings) are normal lint-result exits.
+        if result.returncode not in (0, 1):
+            issues.append(
+                ValidationIssue(
+                    tool="yamllint",
+                    severity=Severity.HIGH,
+                    message=(
+                        f"yamllint execution failed with exit code {result.returncode}"
+                        f"{_diagnostic_suffix(result)}"
+                    ),
                     file_path=file_path,
                 )
             )
@@ -239,20 +277,6 @@ def run_yamllint(file_path: str, timeout: int = 300) -> list[ValidationIssue]:
                             file_path=file_path,
                         )
                     )
-
-        # Non-zero exit without usable findings represents a crash or configuration failure
-        if result.returncode != 0 and not issues:
-            _MAX_DIAG = 200
-            stderr_excerpt = result.stderr.strip()[:_MAX_DIAG]
-            diag = f": {stderr_excerpt}" if stderr_excerpt else ""
-            issues.append(
-                ValidationIssue(
-                    tool="yamllint",
-                    severity=Severity.HIGH,
-                    message=f"yamllint execution failed with exit code {result.returncode}{diag}",
-                    file_path=file_path,
-                )
-            )
 
     except subprocess.TimeoutExpired:
         issues.append(
