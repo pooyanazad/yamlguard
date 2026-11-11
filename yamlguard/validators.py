@@ -135,16 +135,26 @@ def validate_yaml_syntax(file_path: str) -> list[ValidationIssue]:
             # Use safe_load_all to handle multiple documents
             documents = list(yaml.safe_load_all(file))
 
-        # #13 — Detect empty YAML files.
+        # #13 — Detect empty or null-only YAML documents.
         # safe_load_all returns [] for truly empty / whitespace / comment-only
-        # files, and [None] for files that contain an explicit null document.
-        # Neither case contains meaningful data — report as INFO.
-        if not documents or all(doc is None for doc in documents):
+        # files, and [None, ...] for files containing only explicit null or
+        # empty documents. Both are syntactically valid, so keep them INFO.
+        if not documents:
             issues.append(
                 ValidationIssue(
                     tool="yaml",
                     severity=Severity.INFO,
                     message="File is empty or contains only whitespace/comments.",
+                    rule="empty-file",
+                    file_path=file_path,
+                )
+            )
+        elif all(doc is None for doc in documents):
+            issues.append(
+                ValidationIssue(
+                    tool="yaml",
+                    severity=Severity.INFO,
+                    message="File contains only explicit null or empty YAML document(s).",
                     rule="empty-file",
                     file_path=file_path,
                 )
@@ -481,7 +491,31 @@ def _tool_execution(tool: str, issues: list[ValidationIssue]) -> ToolExecution:
     return ToolExecution(tool, ToolStatus.FAILED, failure.message)
 
 
-def validate_yaml_file(  # noqa: PLR0915
+def _summarize_issues(issues: list[ValidationIssue]) -> dict[str, int]:
+    """Count issues by severity level plus total."""
+    return {
+        "total": len(issues),
+        "critical": sum(1 for i in issues if i.severity == Severity.CRITICAL),
+        "high": sum(1 for i in issues if i.severity == Severity.HIGH),
+        "medium": sum(1 for i in issues if i.severity == Severity.MEDIUM),
+        "low": sum(1 for i in issues if i.severity == Severity.LOW),
+        "info": sum(1 for i in issues if i.severity == Severity.INFO),
+    }
+
+
+def _syntax_stage_valid(syntax_issues: list[ValidationIssue], say) -> bool:
+    """Report syntax-stage outcome and return whether YAML syntax is valid."""
+    if any(issue.severity != Severity.INFO for issue in syntax_issues):
+        say("❌ Syntax validation failed", Severity.CRITICAL)
+        return False
+    if syntax_issues:
+        say("✅ Syntax validation passed (informational notice)", Severity.INFO)
+    else:
+        say("✅ Syntax validation passed", Severity.INFO)
+    return True
+
+
+def validate_yaml_file(
     file_path: str,
     tools: ToolAvailability | None = None,
     timeout: int = 300,
@@ -511,18 +545,12 @@ def validate_yaml_file(  # noqa: PLR0915
 
     all_issues: list[ValidationIssue] = []
     tool_status: list[ToolExecution] = []
-    syntax_valid = True
 
     # 1. Check YAML syntax
     _say("\n📋 Checking YAML syntax...", Severity.INFO)
     syntax_issues = validate_yaml_syntax(file_path)
     all_issues.extend(syntax_issues)
-
-    if syntax_issues:
-        syntax_valid = False
-        _say("❌ Syntax validation failed", Severity.CRITICAL)
-    else:
-        _say("✅ Syntax validation passed", Severity.INFO)
+    syntax_valid = _syntax_stage_valid(syntax_issues, _say)
 
     # 2. Run yamllint
     _say("\n🔧 Running yamllint...", Severity.INFO)
@@ -556,21 +584,11 @@ def validate_yaml_file(  # noqa: PLR0915
         else:
             _say("✅ No security issues found", Severity.INFO)
 
-    # Generate summary
-    summary = {
-        "total": len(all_issues),
-        "critical": len([i for i in all_issues if i.severity == Severity.CRITICAL]),
-        "high": len([i for i in all_issues if i.severity == Severity.HIGH]),
-        "medium": len([i for i in all_issues if i.severity == Severity.MEDIUM]),
-        "low": len([i for i in all_issues if i.severity == Severity.LOW]),
-        "info": len([i for i in all_issues if i.severity == Severity.INFO]),
-    }
-
     return ValidationResult(
         file_path=file_path,
         syntax_valid=syntax_valid,
         issues=all_issues,
-        summary=summary,
+        summary=_summarize_issues(all_issues),
         tool_status=tool_status,
     )
 
