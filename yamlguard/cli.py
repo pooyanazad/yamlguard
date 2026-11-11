@@ -17,10 +17,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 # Re-export __version__ so callers can do `from yamlguard.cli import __version__`
 from yamlguard import __version__
-from yamlguard.models import Severity, ToolAvailability
+from yamlguard.models import Severity, ToolAvailability, ValidationResult
 from yamlguard.output import (
     print_colored,
     print_issues,
@@ -190,6 +191,66 @@ def resolve_files(paths: list[str]) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def _exit_with_final_status(results: list[ValidationResult], *, json_mode: bool) -> NoReturn:
+    """Print the final validation banner (in text mode) and exit with the appropriate code."""
+    has_operational_failure = any(r.has_operational_failure for r in results)
+    has_critical_high = any(r.summary["critical"] + r.summary["high"] > 0 for r in results)
+    has_syntax_failure = any(not r.syntax_valid for r in results)
+    total_issues = sum(r.summary["total"] for r in results)
+    total_info = sum(r.summary.get("info", 0) for r in results)
+
+    if not json_mode:
+        print_colored("\n" + "=" * 60, Severity.INFO)
+
+    if has_operational_failure:
+        # A tool that did not finish means the scan is incomplete, so it can
+        # never be reported as a success regardless of the findings it produced.
+        if not json_mode:
+            print_colored(
+                "💥 Validation incomplete! A validator failed to run.",
+                Severity.CRITICAL,
+                bold=True,
+            )
+        sys.exit(1)
+
+    if has_critical_high or has_syntax_failure:
+        message = (
+            "💥 Validation failed! Found critical/high severity issues."
+            if has_critical_high
+            else "💥 Validation failed! Input or syntax validation failed."
+        )
+        if not json_mode:
+            print_colored(message, Severity.CRITICAL, bold=True)
+        sys.exit(1)
+
+    if total_issues == 0:
+        if not json_mode:
+            print_colored(
+                "🎉 Validation completed successfully! No issues found.",
+                Severity.INFO,
+                bold=True,
+            )
+        sys.exit(0)
+
+    if total_issues == total_info:
+        if not json_mode:
+            print_colored(
+                f"ℹ️  Validation completed with {total_issues} informational notice(s).",
+                Severity.INFO,
+                bold=True,
+            )
+        sys.exit(0)
+
+    if not json_mode:
+        print_colored(
+            f"⚠️  Validation completed with {total_issues} minor issues.",
+            Severity.MEDIUM,
+            bold=True,
+        )
+    sys.exit(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:  # noqa: PLR0912, PLR0915
     """Parse arguments, validate files, and set the process exit code."""
     parser = argparse.ArgumentParser(
@@ -262,8 +323,6 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     json_mode = args.format != "text"
 
     results = []
-    has_critical_high = False
-    has_operational_failure = False
     total_issues = 0
 
     for yaml_file in yaml_files:
@@ -281,11 +340,6 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             print_tool_status(result.tool_status)
             print_summary_table(result.summary)
 
-        critical_high = result.summary["critical"] + result.summary["high"]
-        if critical_high > 0:
-            has_critical_high = True
-        if result.has_operational_failure:
-            has_operational_failure = True
         total_issues += result.summary["total"]
 
     # ── Machine-readable output (single emit at the end) ──────────────────────
@@ -320,49 +374,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             print_colored("\n📁 Files with issues:", Severity.MEDIUM, bold=True)
             for r in files_with_issues:
                 ch = r.summary["critical"] + r.summary["high"]
-                icon = "💥" if ch > 0 else "⚠️"
+                failed_file = ch > 0 or not r.syntax_valid or r.has_operational_failure
+                icon = "💥" if failed_file else "⚠️"
                 print_colored(
                     f"   {icon} {r.file_path} ({r.summary['total']} issues)",
                     Severity.MEDIUM,
                 )
 
-    # Final status
-    if not json_mode:
-        print_colored("\n" + "=" * 60, Severity.INFO)
-    if has_operational_failure:
-        # A tool that did not finish means the scan is incomplete, so it can
-        # never be reported as a success regardless of the findings it produced.
-        if not json_mode:
-            print_colored(
-                "💥 Validation incomplete! A validator failed to run.",
-                Severity.CRITICAL,
-                bold=True,
-            )
-        sys.exit(1)
-    if total_issues == 0:
-        if not json_mode:
-            print_colored(
-                "🎉 Validation completed successfully! No issues found.",
-                Severity.INFO,
-                bold=True,
-            )
-        sys.exit(0)
-    elif has_critical_high:
-        if not json_mode:
-            print_colored(
-                "💥 Validation failed! Found critical/high severity issues.",
-                Severity.CRITICAL,
-                bold=True,
-            )
-        sys.exit(1)
-    else:
-        if not json_mode:
-            print_colored(
-                f"⚠️  Validation completed with {total_issues} minor issues.",
-                Severity.MEDIUM,
-                bold=True,
-            )
-        sys.exit(0)
+    _exit_with_final_status(results, json_mode=json_mode)
 
 
 __all__ = ["check_dependencies", "main", "resolve_files"]

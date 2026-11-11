@@ -2,7 +2,9 @@
 
 import json
 import os
+import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +12,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from yamlguard.models import Severity, ToolAvailability, ToolStatus, ValidationIssue  # noqa: E402
+from yamlguard import cli  # noqa: E402
+from yamlguard.models import (  # noqa: E402
+    Severity,
+    ToolAvailability,
+    ToolStatus,
+    ValidationIssue,
+    ValidationResult,
+)
 from yamlguard.output import result_to_json  # noqa: E402
 from yamlguard.validators import (  # noqa: E402
     BINARY_FILE_RULE,
@@ -280,3 +289,131 @@ class TestUnvalidatedInputDownstreamSkipping:
         statuses = {e.tool: e.status for e in result.tool_status}
         assert statuses["yamllint"] is ToolStatus.COMPLETED
         assert statuses["checkov"] is ToolStatus.SKIPPED
+
+
+ROOT = Path(__file__).parent.parent
+
+
+def _run_cli(*args):
+    return subprocess.run(
+        [sys.executable, "-m", "yamlguard", *args],
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+    )
+
+
+class TestCliSyntaxAndUnvalidatedStatus:
+    """End-to-end CLI and report checks for T04 and T05."""
+
+    @pytest.mark.parametrize(
+        ("name", "content"),
+        [
+            ("empty", ""),
+            ("comment", "# only comments\n"),
+            ("explicit_null", "---\nnull\n"),
+        ],
+    )
+    def test_empty_and_null_files_exit_zero_in_text_and_json(self, tmp_path, name, content):
+        doc = tmp_path / f"{name}.yaml"
+        doc.write_text(content, encoding="utf-8")
+
+        text_proc = _run_cli("--no-security", str(doc))
+        assert text_proc.returncode == 0
+        assert "Syntax validation passed" in text_proc.stdout
+        assert "Syntax validation failed" not in text_proc.stdout
+        assert "informational notice" in text_proc.stdout.lower()
+
+        json_proc = _run_cli("--no-security", "-f", "json", str(doc))
+        assert json_proc.returncode == 0
+        payload = json.loads(json_proc.stdout)
+        assert payload["syntax_valid"] is True
+        assert payload["summary"]["critical"] == 0
+        assert payload["summary"]["info"] == 1
+
+    def test_binary_file_exits_one_without_success_message(self, tmp_path):
+        blob = tmp_path / "binary.yaml"
+        blob.write_bytes(b"\x00\x01\x02\x03binary")
+
+        proc = _run_cli("--no-security", str(blob))
+        assert proc.returncode == 1
+        assert "Validation completed" not in proc.stdout
+        assert "minor issues" not in proc.stdout
+        assert "Validation failed" in proc.stdout
+
+    def test_undecodable_file_exits_one_across_machine_formats(self, tmp_path):
+        bad = tmp_path / "bad_utf8.yaml"
+        bad.write_bytes(b"key: \xff\xfe\n")
+
+        json_proc = _run_cli("--no-security", "-f", "json", str(bad))
+        assert json_proc.returncode == 1
+        payload = json.loads(json_proc.stdout)
+        assert payload["syntax_valid"] is False
+        assert payload["summary"]["critical"] == 1
+        assert payload["issues"][0]["rule"] == ENCODING_ERROR_RULE
+
+        sarif_proc = _run_cli("--no-security", "-f", "sarif", str(bad))
+        assert sarif_proc.returncode == 1
+        sarif = json.loads(sarif_proc.stdout)
+        assert sarif["runs"][0]["results"][0]["level"] == "error"
+
+        junit_proc = _run_cli("--no-security", "-f", "junit", str(bad))
+        assert junit_proc.returncode == 1
+        junit_root = ET.fromstring(junit_proc.stdout)
+        assert junit_root.get("failures") == "1"
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses permission checks")
+    def test_unreadable_file_exits_one_without_success_message(self, tmp_path):
+        locked = tmp_path / "locked.yaml"
+        locked.write_text("key: value\n", encoding="utf-8")
+        locked.chmod(0o000)
+        try:
+            proc = _run_cli("--no-security", str(locked))
+            assert proc.returncode == 1
+            assert "Validation completed" not in proc.stdout
+            assert "minor issues" not in proc.stdout
+            assert "Permission denied" in proc.stdout
+        finally:
+            locked.chmod(0o644)
+
+    def test_malformed_yaml_exits_one_and_retains_lint_feedback(self, tmp_path):
+        broken = tmp_path / "broken.yaml"
+        broken.write_text("key: value   \nbad: [unclosed\n", encoding="utf-8")
+
+        proc = _run_cli("--no-security", "-f", "json", str(broken))
+        assert proc.returncode == 1
+        payload = json.loads(proc.stdout)
+        assert payload["syntax_valid"] is False
+        tools = {issue["tool"] for issue in payload["issues"]}
+        assert "yaml" in tools
+        assert "yamllint" in tools
+
+    def test_cli_never_exits_zero_when_syntax_valid_is_false(self, monkeypatch, capsys, tmp_path):
+        target = tmp_path / "dummy.yaml"
+        target.write_text("a: 1\n", encoding="utf-8")
+        fake_result = ValidationResult(
+            file_path=str(target),
+            syntax_valid=False,
+            issues=[],
+            summary={"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+        )
+        monkeypatch.setattr(sys, "argv", ["yamlguard", "--no-security", str(target)])
+        monkeypatch.setattr(cli, "check_dependencies", lambda: ToolAvailability(checkov=False))
+        monkeypatch.setattr(cli, "validate_yaml_file", lambda *a, **k: fake_result)
+
+        with pytest.raises(SystemExit) as exited:
+            cli.main()
+
+        assert exited.value.code == 1
+        out = capsys.readouterr().out
+        assert "Validation failed" in out
+        assert "No issues found" not in out
+
+    def test_multifile_run_with_clean_and_binary_file_fails(self, clean_file, tmp_path):
+        blob = tmp_path / "blob.yaml"
+        blob.write_bytes(b"\x00\x01binary")
+
+        proc = _run_cli("--no-security", clean_file, str(blob))
+        assert proc.returncode == 1
+        assert "Files scanned: 2" in proc.stdout
+        assert "Validation failed" in proc.stdout
