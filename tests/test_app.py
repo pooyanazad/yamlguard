@@ -158,15 +158,15 @@ class TestValidateYamlSyntax:
 
     # ── #14: binary files ────────────────────────────────────────────────────
 
-    def test_binary_file_reports_medium_warning(self):
-        """A binary file (contains null bytes) should warn MEDIUM, not crash (#14)."""
+    def test_binary_file_reports_critical_error(self):
+        """A binary file (contains null bytes) should fail as CRITICAL, not crash (#14, T05)."""
         f = tempfile.NamedTemporaryFile(suffix=".yaml", delete=False)
         f.write(b"\x00\x01\x02binary\x00data")
         f.close()
         try:
             issues = validate_yaml_syntax(f.name)
             assert len(issues) == 1
-            assert issues[0].severity == Severity.MEDIUM
+            assert issues[0].severity == Severity.CRITICAL
             assert issues[0].rule == "binary-file"
             assert "binary" in issues[0].message.lower()
         finally:

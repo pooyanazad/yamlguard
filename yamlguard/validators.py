@@ -18,6 +18,7 @@ import subprocess
 import sys
 
 import yaml
+from yaml.reader import ReaderError
 
 from yamlguard.models import (
     Severity,
@@ -36,6 +37,26 @@ LARGE_FILE_WARNING_THRESHOLD = 1024 * 1024
 # Issues carrying this rule mean "the tool did not finish", not "the file has a
 # problem". Severity alone cannot express that distinction.
 OPERATIONAL_ERROR_RULE = "operational-error"
+
+EMPTY_FILE_RULE = "empty-file"
+BINARY_FILE_RULE = "binary-file"
+SYNTAX_ERROR_RULE = "syntax"
+FILE_NOT_FOUND_RULE = "file-not-found"
+PERMISSION_DENIED_RULE = "permission-denied"
+READ_ERROR_RULE = "read-error"
+ENCODING_ERROR_RULE = "encoding-error"
+
+# Syntax-stage findings carrying these rules mean the input could not be read,
+# decoded, or treated as text YAML — downstream linters/scanners must skip it.
+UNVALIDATED_INPUT_RULES = frozenset(
+    {
+        BINARY_FILE_RULE,
+        ENCODING_ERROR_RULE,
+        FILE_NOT_FOUND_RULE,
+        PERMISSION_DENIED_RULE,
+        READ_ERROR_RULE,
+    }
+)
 
 # Operational errors quote a short excerpt of tool output. Keep it bounded and
 # strip anything that looks like a credential so reports stay safe to publish.
@@ -77,141 +98,130 @@ def warn_if_large_file(file_path: str) -> None:
         )
 
 
+def _yaml_issue(
+    file_path: str,
+    message: str,
+    *,
+    severity: Severity = Severity.CRITICAL,
+    rule: str | None = None,
+) -> ValidationIssue:
+    """Build a ValidationIssue attributed to the ``yaml`` syntax stage."""
+    return ValidationIssue(
+        tool="yaml",
+        severity=severity,
+        message=message,
+        rule=rule,
+        file_path=file_path,
+    )
+
+
+def _binary_file_issue(file_path: str) -> ValidationIssue:
+    return _yaml_issue(
+        file_path,
+        (
+            f"File appears to be binary (contains null bytes): {file_path}. "
+            "Rename or remove the file — it cannot be validated as YAML."
+        ),
+        rule=BINARY_FILE_RULE,
+    )
+
+
+def _check_readable_text_prefix(file_path: str) -> ValidationIssue | None:
+    """Verify the file exists, is readable, and does not start with null bytes."""
+    if not os.path.exists(file_path):
+        return _yaml_issue(file_path, f"File not found: {file_path}", rule=FILE_NOT_FOUND_RULE)
+    if not os.access(file_path, os.R_OK):
+        return _yaml_issue(
+            file_path, f"Permission denied: {file_path}", rule=PERMISSION_DENIED_RULE
+        )
+    try:
+        with open(file_path, "rb") as raw:
+            if b"\x00" in raw.read(8192):
+                return _binary_file_issue(file_path)
+    except OSError as e:
+        return _yaml_issue(file_path, f"File reading error: {e!s}", rule=READ_ERROR_RULE)
+    return None
+
+
+def _yaml_error_issue(file_path: str, err: yaml.YAMLError) -> ValidationIssue:
+    """Convert a PyYAML exception into a structured ValidationIssue."""
+    if isinstance(err, ReaderError):
+        if getattr(err, "character", None) == 0 or "#x0000" in str(err):
+            return _binary_file_issue(file_path)
+        return _yaml_issue(
+            file_path,
+            f"File contains non-printable characters and cannot be validated as YAML: {err!s}",
+            rule=ENCODING_ERROR_RULE,
+        )
+    mark = getattr(err, "problem_mark", None)
+    return ValidationIssue(
+        tool="yaml",
+        severity=Severity.CRITICAL,
+        message=str(err),
+        line=mark.line + 1 if mark else None,
+        column=mark.column + 1 if mark else None,
+        rule=SYNTAX_ERROR_RULE,
+        file_path=file_path,
+    )
+
+
+def _load_yaml_documents(file_path: str) -> tuple[list[object], ValidationIssue | None]:
+    """Decode ``file_path`` as UTF-8 and load all YAML documents."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            return list(yaml.safe_load_all(file)), None
+    except yaml.YAMLError as e:
+        return [], _yaml_error_issue(file_path, e)
+    except FileNotFoundError:
+        return [], _yaml_issue(file_path, f"File not found: {file_path}", rule=FILE_NOT_FOUND_RULE)
+    except PermissionError:
+        return [], _yaml_issue(
+            file_path, f"Permission denied: {file_path}", rule=PERMISSION_DENIED_RULE
+        )
+    except UnicodeDecodeError as e:
+        return [], _yaml_issue(
+            file_path,
+            f"File encoding error (not valid UTF-8): {e!s}",
+            rule=ENCODING_ERROR_RULE,
+        )
+    except OSError as e:
+        return [], _yaml_issue(file_path, f"File reading error: {e!s}", rule=READ_ERROR_RULE)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 def validate_yaml_syntax(file_path: str) -> list[ValidationIssue]:
     """Validate YAML syntax using PyYAML."""
-    issues: list[ValidationIssue] = []
+    preflight_issue = _check_readable_text_prefix(file_path)
+    if preflight_issue is not None:
+        return [preflight_issue]
 
-    # Check file existence and read permission before opening
-    if not os.path.exists(file_path):
+    documents, load_issue = _load_yaml_documents(file_path)
+    if load_issue is not None:
+        return [load_issue]
+
+    # #13 — Detect empty or null-only YAML documents.
+    # safe_load_all returns [] for truly empty / whitespace / comment-only
+    # files, and [None, ...] for files containing only explicit null or
+    # empty documents. Both are syntactically valid, so keep them INFO.
+    if not documents:
         return [
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"File not found: {file_path}",
-                file_path=file_path,
+            _yaml_issue(
+                file_path,
+                "File is empty or contains only whitespace/comments.",
+                severity=Severity.INFO,
+                rule=EMPTY_FILE_RULE,
             )
         ]
-    if not os.access(file_path, os.R_OK):
+    if all(doc is None for doc in documents):
         return [
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"Permission denied: {file_path}",
-                file_path=file_path,
+            _yaml_issue(
+                file_path,
+                "File contains only explicit null or empty YAML document(s).",
+                severity=Severity.INFO,
+                rule=EMPTY_FILE_RULE,
             )
         ]
-
-    # #14 — Detect binary files early by sniffing for null bytes.
-    # Avoids a confusing UnicodeDecodeError later; report as MEDIUM warning.
-    try:
-        with open(file_path, "rb") as raw:
-            chunk = raw.read(8192)
-        if b"\x00" in chunk:
-            return [
-                ValidationIssue(
-                    tool="yaml",
-                    severity=Severity.MEDIUM,
-                    message=(
-                        f"File appears to be binary (contains null bytes): {file_path}. "
-                        "Rename or remove the file — it cannot be validated as YAML."
-                    ),
-                    rule="binary-file",
-                    file_path=file_path,
-                )
-            ]
-    except OSError as e:
-        return [
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"File reading error: {e!s}",
-                file_path=file_path,
-            )
-        ]
-
-    try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            # Use safe_load_all to handle multiple documents
-            documents = list(yaml.safe_load_all(file))
-
-        # #13 — Detect empty or null-only YAML documents.
-        # safe_load_all returns [] for truly empty / whitespace / comment-only
-        # files, and [None, ...] for files containing only explicit null or
-        # empty documents. Both are syntactically valid, so keep them INFO.
-        if not documents:
-            issues.append(
-                ValidationIssue(
-                    tool="yaml",
-                    severity=Severity.INFO,
-                    message="File is empty or contains only whitespace/comments.",
-                    rule="empty-file",
-                    file_path=file_path,
-                )
-            )
-        elif all(doc is None for doc in documents):
-            issues.append(
-                ValidationIssue(
-                    tool="yaml",
-                    severity=Severity.INFO,
-                    message="File contains only explicit null or empty YAML document(s).",
-                    rule="empty-file",
-                    file_path=file_path,
-                )
-            )
-    except yaml.YAMLError as e:
-        mark = getattr(e, "problem_mark", None)
-        line_num = mark.line + 1 if mark else None
-        column_num = mark.column + 1 if mark else None
-        issues.append(
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=str(e),
-                line=line_num,
-                column=column_num,
-                rule="syntax",
-                file_path=file_path,
-            )
-        )
-    except FileNotFoundError:
-        issues.append(
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"File not found: {file_path}",
-                file_path=file_path,
-            )
-        )
-    except PermissionError:
-        issues.append(
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"Permission denied: {file_path}",
-                file_path=file_path,
-            )
-        )
-    except UnicodeDecodeError as e:
-        issues.append(
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"File encoding error (not valid UTF-8): {e!s}",
-                file_path=file_path,
-            )
-        )
-    except OSError as e:
-        issues.append(
-            ValidationIssue(
-                tool="yaml",
-                severity=Severity.CRITICAL,
-                message=f"File reading error: {e!s}",
-                file_path=file_path,
-            )
-        )
-
-    return issues
+    return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,8 +604,16 @@ def validate_yaml_file(
 
 
 __all__ = [
+    "BINARY_FILE_RULE",
+    "EMPTY_FILE_RULE",
+    "ENCODING_ERROR_RULE",
+    "FILE_NOT_FOUND_RULE",
     "LARGE_FILE_WARNING_THRESHOLD",
     "OPERATIONAL_ERROR_RULE",
+    "PERMISSION_DENIED_RULE",
+    "READ_ERROR_RULE",
+    "SYNTAX_ERROR_RULE",
+    "UNVALIDATED_INPUT_RULES",
     "run_checkov",
     "run_yamllint",
     "validate_yaml_file",
