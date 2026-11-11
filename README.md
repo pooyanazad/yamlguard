@@ -105,10 +105,14 @@ In version 3.5.0 and newer, machine-readable reports go to stdout and warnings g
 | Exit code | Meaning |
 | --- | --- |
 | `0` | No findings, or only Medium / Low / Info findings. |
-| `1` | Critical / High findings, no matching files, or a required dependency is missing. |
+| `1` | Critical / High findings, a validator failure, no matching files, or a required dependency is missing. |
 | `2` | Invalid command-line arguments. |
 
 Syntax errors are Critical. Lint errors are Medium and warnings are Low, so **lint findings alone do not fail the command**. Checkov findings without a severity default to High.
+
+- **Empty, comment-only, and explicit null documents** are syntactically valid (`syntax_valid: true` in JSON) and emit an `Info` notice without failing the command.
+- **Readable files with syntax errors** still run yamllint (and Checkov when enabled) so you retain lint feedback alongside the syntax error.
+- **Unreadable, non-UTF-8, and binary files** are `Critical` validation failures (`syntax_valid: false`, exit `1`) and skip downstream yamllint and Checkov scans. *(Behavior change: earlier versions reported binary files as a non-failing `Medium` warning.)*
 
 ## Project links
 

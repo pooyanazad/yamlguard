@@ -190,7 +190,13 @@ def _load_yaml_documents(file_path: str) -> tuple[list[object], ValidationIssue 
 
 # ─────────────────────────────────────────────────────────────────────────────
 def validate_yaml_syntax(file_path: str) -> list[ValidationIssue]:
-    """Validate YAML syntax using PyYAML."""
+    """Validate YAML syntax using PyYAML.
+
+    Returns ``INFO`` for empty, comment-only, or null-only documents,
+    ``CRITICAL`` (``rule="syntax"``) for readable malformed YAML, and
+    ``CRITICAL`` with an ``UNVALIDATED_INPUT_RULES`` rule when the file cannot
+    be read, decoded as UTF-8, or appears to be binary.
+    """
     preflight_issue = _check_readable_text_prefix(file_path)
     if preflight_issue is not None:
         return [preflight_issue]
@@ -603,6 +609,12 @@ def validate_yaml_file(
     quiet: bool = False,
 ) -> ValidationResult:
     """Validate a YAML file using all available tools.
+
+    Informational syntax findings (such as empty or null-only documents) keep
+    ``syntax_valid=True``. Readable files with YAML syntax errors mark
+    ``syntax_valid=False`` while still running yamllint (and Checkov when
+    enabled). Unreadable, undecodable, and binary files mark
+    ``syntax_valid=False`` and skip downstream scans.
 
     Args:
         file_path:   Path to the YAML file to validate.
