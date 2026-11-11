@@ -513,6 +513,76 @@ def _summarize_issues(issues: list[ValidationIssue]) -> dict[str, int]:
     }
 
 
+_UNVALIDATED_REASON_BY_RULE = {
+    BINARY_FILE_RULE: "binary input",
+    ENCODING_ERROR_RULE: "undecodable input",
+    FILE_NOT_FOUND_RULE: "file not found",
+    PERMISSION_DENIED_RULE: "permission denied",
+    READ_ERROR_RULE: "unreadable input",
+}
+
+
+def _unvalidated_input_reason(syntax_issues: list[ValidationIssue]) -> str | None:
+    """Return a short reason if syntax-stage findings mean the file cannot be scanned."""
+    for issue in syntax_issues:
+        if issue.rule in UNVALIDATED_INPUT_RULES:
+            return _UNVALIDATED_REASON_BY_RULE[issue.rule]
+        if issue.severity != Severity.INFO and issue.rule != SYNTAX_ERROR_RULE:
+            return "unreadable or invalid input"
+    return None
+
+
+def _skipped_checkov(
+    no_security: bool,
+    tools: ToolAvailability,
+    *,
+    unvalidated_reason: str | None = None,
+) -> tuple[ToolExecution, str] | None:
+    """Return a skip status and display label if Checkov should not run."""
+    if no_security:
+        return (
+            ToolExecution("checkov", ToolStatus.SKIPPED, "security checks disabled"),
+            "--no-security",
+        )
+    if not tools.checkov:
+        return (
+            ToolExecution("checkov", ToolStatus.SKIPPED, "checkov not available"),
+            "checkov not available",
+        )
+    if unvalidated_reason is not None:
+        return (
+            ToolExecution("checkov", ToolStatus.SKIPPED, f"skipped: {unvalidated_reason}"),
+            unvalidated_reason,
+        )
+    return None
+
+
+def _unvalidated_result(
+    file_path: str,
+    syntax_issues: list[ValidationIssue],
+    unvalidated_reason: str,
+    checkov_skip: tuple[ToolExecution, str] | None,
+    say,
+) -> ValidationResult:
+    """Build a failed ValidationResult and skip downstream tools for unreadable/binary input."""
+    say(f"❌ Input could not be validated ({unvalidated_reason})", Severity.CRITICAL)
+    tool_status = [ToolExecution("yamllint", ToolStatus.SKIPPED, f"skipped: {unvalidated_reason}")]
+    say(f"\n⚠️  yamllint skipped ({unvalidated_reason})", Severity.MEDIUM)
+
+    if checkov_skip is not None:
+        execution, skipped_by = checkov_skip
+        tool_status.append(execution)
+        say(f"\n⚠️  Security checks skipped ({skipped_by})", Severity.MEDIUM)
+
+    return ValidationResult(
+        file_path=file_path,
+        syntax_valid=False,
+        issues=list(syntax_issues),
+        summary=_summarize_issues(syntax_issues),
+        tool_status=tool_status,
+    )
+
+
 def _syntax_stage_valid(syntax_issues: list[ValidationIssue], say) -> bool:
     """Report syntax-stage outcome and return whether YAML syntax is valid."""
     if any(issue.severity != Severity.INFO for issue in syntax_issues):
@@ -550,8 +620,6 @@ def validate_yaml_file(
 
     _say(f"\n🔍 Validating: {file_path}", Severity.INFO, bold=True)
     _say("=" * 60, Severity.INFO)
-    if not no_security and not quiet:
-        warn_if_large_file(file_path)
 
     all_issues: list[ValidationIssue] = []
     tool_status: list[ToolExecution] = []
@@ -560,6 +628,18 @@ def validate_yaml_file(
     _say("\n📋 Checking YAML syntax...", Severity.INFO)
     syntax_issues = validate_yaml_syntax(file_path)
     all_issues.extend(syntax_issues)
+
+    unvalidated_reason = _unvalidated_input_reason(syntax_issues)
+    if unvalidated_reason is not None:
+        checkov_skip = _skipped_checkov(no_security, tools, unvalidated_reason=unvalidated_reason)
+        return _unvalidated_result(
+            file_path,
+            syntax_issues,
+            unvalidated_reason,
+            checkov_skip,
+            _say,
+        )
+
     syntax_valid = _syntax_stage_valid(syntax_issues, _say)
 
     # 2. Run yamllint
@@ -576,12 +656,14 @@ def validate_yaml_file(
         _say("✅ No linting issues found", Severity.INFO)
 
     # 3. Run checkov (if available)
-    if no_security or not tools.checkov:
-        skipped_by = "--no-security" if no_security else "checkov not available"
-        reason = "security checks disabled" if no_security else skipped_by
-        tool_status.append(ToolExecution("checkov", ToolStatus.SKIPPED, reason))
+    checkov_skip = _skipped_checkov(no_security, tools)
+    if checkov_skip is not None:
+        execution, skipped_by = checkov_skip
+        tool_status.append(execution)
         _say(f"\n⚠️  Security checks skipped ({skipped_by})", Severity.MEDIUM)
     else:
+        if not quiet:
+            warn_if_large_file(file_path)
         _say("\n🔒 Running security checks (checkov)...", Severity.INFO)
         checkov_issues = run_checkov(file_path, timeout=timeout)
         all_issues.extend(checkov_issues)

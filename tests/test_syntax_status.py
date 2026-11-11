@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from yamlguard.models import Severity, ToolAvailability  # noqa: E402
+from yamlguard.models import Severity, ToolAvailability, ToolStatus, ValidationIssue  # noqa: E402
 from yamlguard.output import result_to_json  # noqa: E402
 from yamlguard.validators import (  # noqa: E402
     BINARY_FILE_RULE,
@@ -174,3 +174,109 @@ class TestUnvalidatedInputSyntax:
         assert issues[0].severity == Severity.CRITICAL
         assert issues[0].rule == ENCODING_ERROR_RULE
         assert issues[0].rule in UNVALIDATED_INPUT_RULES
+
+
+class TestUnvalidatedInputDownstreamSkipping:
+    """T05: unvalidated inputs skip downstream scanners while malformed YAML keeps lint."""
+
+    def test_binary_file_skips_yamllint_checkov_and_size_warning(self, tmp_path):
+        bin_file = tmp_path / "blob.yaml"
+        bin_file.write_bytes(b"\x00\x01\x02not-yaml")
+
+        with (
+            patch("yamlguard.validators.run_yamllint") as mock_lint,
+            patch("yamlguard.validators.run_checkov") as mock_checkov,
+            patch("yamlguard.validators.warn_if_large_file") as mock_warn,
+        ):
+            result = validate_yaml_file(str(bin_file), ToolAvailability(checkov=True), quiet=False)
+
+        mock_lint.assert_not_called()
+        mock_checkov.assert_not_called()
+        mock_warn.assert_not_called()
+        assert result.syntax_valid is False
+        assert result.summary["critical"] == 1
+        assert result.has_operational_failure is False
+        statuses = {e.tool: e for e in result.tool_status}
+        assert statuses["yamllint"].status is ToolStatus.SKIPPED
+        assert statuses["checkov"].status is ToolStatus.SKIPPED
+
+    def test_undecodable_file_skips_downstream_tools(self, tmp_path):
+        bad = tmp_path / "bad_utf8.yaml"
+        bad.write_bytes(b"key: \xff\xfe\n")
+
+        with (
+            patch("yamlguard.validators.run_yamllint") as mock_lint,
+            patch("yamlguard.validators.run_checkov") as mock_checkov,
+        ):
+            result = validate_yaml_file(str(bad), ToolAvailability(checkov=True), quiet=True)
+
+        mock_lint.assert_not_called()
+        mock_checkov.assert_not_called()
+        assert result.syntax_valid is False
+        assert result.summary["critical"] == 1
+        assert {e.status for e in result.tool_status} == {ToolStatus.SKIPPED}
+
+    def test_missing_file_skips_downstream_tools(self, tmp_path):
+        with (
+            patch("yamlguard.validators.run_yamllint") as mock_lint,
+            patch("yamlguard.validators.run_checkov") as mock_checkov,
+        ):
+            result = validate_yaml_file(
+                str(tmp_path / "absent.yaml"), ToolAvailability(checkov=True), quiet=True
+            )
+
+        mock_lint.assert_not_called()
+        mock_checkov.assert_not_called()
+        assert result.syntax_valid is False
+        assert result.summary["critical"] == 1
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses permission checks")
+    def test_unreadable_file_skips_downstream_tools(self, tmp_path):
+        locked = tmp_path / "locked.yaml"
+        locked.write_text("key: value\n", encoding="utf-8")
+        locked.chmod(0o000)
+        try:
+            with (
+                patch("yamlguard.validators.run_yamllint") as mock_lint,
+                patch("yamlguard.validators.run_checkov") as mock_checkov,
+            ):
+                result = validate_yaml_file(str(locked), ToolAvailability(checkov=True), quiet=True)
+
+            mock_lint.assert_not_called()
+            mock_checkov.assert_not_called()
+            assert result.syntax_valid is False
+            assert result.summary["critical"] == 1
+        finally:
+            locked.chmod(0o644)
+
+    def test_mocked_unclassified_syntax_error_still_skips_downstream_tools(self, tmp_path):
+        target = tmp_path / "any.yaml"
+        target.write_text("key: value\n", encoding="utf-8")
+        custom_issue = [ValidationIssue("yaml", Severity.CRITICAL, "cannot read stream")]
+
+        with (
+            patch("yamlguard.validators.validate_yaml_syntax", return_value=custom_issue),
+            patch("yamlguard.validators.run_yamllint") as mock_lint,
+            patch("yamlguard.validators.run_checkov") as mock_checkov,
+        ):
+            result = validate_yaml_file(str(target), ToolAvailability(checkov=True), quiet=True)
+
+        mock_lint.assert_not_called()
+        mock_checkov.assert_not_called()
+        assert result.syntax_valid is False
+
+    def test_readable_malformed_yaml_retains_yamllint_feedback(self, tmp_path):
+        broken = tmp_path / "broken_with_lint.yaml"
+        broken.write_text("key: value   \nbad: [unclosed\n", encoding="utf-8")
+
+        result = validate_yaml_file(str(broken), ToolAvailability(checkov=False), quiet=True)
+
+        assert result.syntax_valid is False
+        tools = {i.tool for i in result.issues}
+        assert "yaml" in tools
+        assert "yamllint" in tools
+        assert result.summary["critical"] >= 1
+        assert result.summary["medium"] + result.summary["low"] >= 1
+        statuses = {e.tool: e.status for e in result.tool_status}
+        assert statuses["yamllint"] is ToolStatus.COMPLETED
+        assert statuses["checkov"] is ToolStatus.SKIPPED
