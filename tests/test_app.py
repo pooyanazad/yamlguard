@@ -811,13 +811,14 @@ class TestCliSecurityOption:
             patch(
                 "yamlguard.cli.check_dependencies",
                 return_value=ToolAvailability(),
-            ),
+            ) as mock_deps,
             patch("yamlguard.cli.validate_yaml_file", return_value=result) as mock_validate,
             pytest.raises(SystemExit) as exit_info,
         ):
             validator.main()
 
         assert exit_info.value.code == 0
+        mock_deps.assert_called_once_with(no_security=True)
         mock_validate.assert_called_once_with(
             "config.yaml",
             ToolAvailability(),
@@ -825,6 +826,28 @@ class TestCliSecurityOption:
             no_security=True,
             quiet=False,
         )
+
+    def test_no_security_runs_only_yamllint_subprocesses(self, clean_file, capsys):
+        def fake_run(command, **kwargs):
+            if command[1:3] != ["-m", "yamllint"]:
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with (
+            patch.object(sys, "argv", ["yamlguard", "--no-security", clean_file]),
+            patch("subprocess.run", side_effect=fake_run) as run,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            validator.main()
+
+        assert exit_info.value.code == 0
+        assert [call.args[0][1:] for call in run.call_args_list] == [
+            ["-m", "yamllint", "--version"],
+            ["-m", "yamllint", "-f", "parsable", clean_file],
+        ]
+        output = capsys.readouterr()
+        assert "Security checks skipped (--no-security)" in output.out
+        assert "checkov not available" not in output.out + output.err
 
 
 # ═════════════════════════════════════════════════════════════════════════════

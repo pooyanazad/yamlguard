@@ -143,7 +143,7 @@ class TestCliOperationalFailure:
 
         monkeypatch.setattr(sys, "argv", ["yamlguard", *argv])
         monkeypatch.setattr(cli, "validate_yaml_file", lambda *a, **k: result)
-        monkeypatch.setattr(cli, "check_dependencies", ToolAvailability)
+        monkeypatch.setattr(cli, "check_dependencies", lambda **_: ToolAvailability())
         with pytest.raises(SystemExit) as excinfo:
             cli.main()
         return excinfo.value.code

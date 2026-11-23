@@ -38,10 +38,10 @@ _PYTHON = sys.executable
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def check_dependencies() -> ToolAvailability:
-    """Check if required tools are installed and return their availability."""
+def check_dependencies(*, no_security: bool = False) -> ToolAvailability:
+    """Check tool availability and skip probing Checkov when security is disabled."""
     missing_tools: list[str] = []
-    tools = ToolAvailability()
+    tools = ToolAvailability(checkov=not no_security)
 
     # Check yamllint
     try:
@@ -59,24 +59,24 @@ def check_dependencies() -> ToolAvailability:
         tools.yamllint = False
         missing_tools.append("yamllint")
 
-    # Check checkov (optional)
-    try:
-        subprocess.run(
-            [_PYTHON, "-c", "import checkov"],
-            capture_output=True,
-            check=True,
-            timeout=30,
-        )
-    except (
-        subprocess.CalledProcessError,
-        FileNotFoundError,
-        subprocess.TimeoutExpired,
-    ):
-        tools.checkov = False
-        print_colored(
-            "Warning: checkov not available, security checks will be skipped",
-            Severity.MEDIUM,
-        )
+    if not no_security:
+        try:
+            subprocess.run(
+                [_PYTHON, "-c", "import checkov"],
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
+        except (
+            subprocess.CalledProcessError,
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+        ):
+            tools.checkov = False
+            print_colored(
+                "Warning: checkov not available, security checks will be skipped",
+                Severity.MEDIUM,
+            )
 
     if missing_tools:
         print_colored(
@@ -84,7 +84,7 @@ def check_dependencies() -> ToolAvailability:
             Severity.CRITICAL,
             bold=True,
         )
-        print_colored("Install with: python3 -m pip install yamllint checkov", Severity.INFO)
+        print_colored("Install with: python3 -m pip install yamllint", Severity.INFO)
         sys.exit(1)
 
     return tools
@@ -317,7 +317,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         sys.exit(1)
 
     with contextlib.redirect_stdout(diagnostic_output):
-        tools = check_dependencies()
+        tools = check_dependencies(no_security=args.no_security)
 
     # Any non-text format is machine-readable: keep stdout free of decoration.
     json_mode = args.format != "text"

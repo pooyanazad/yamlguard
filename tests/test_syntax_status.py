@@ -398,7 +398,7 @@ class TestCliSyntaxAndUnvalidatedStatus:
             summary={"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
         )
         monkeypatch.setattr(sys, "argv", ["yamlguard", "--no-security", str(target)])
-        monkeypatch.setattr(cli, "check_dependencies", lambda: ToolAvailability(checkov=False))
+        monkeypatch.setattr(cli, "check_dependencies", lambda **_: ToolAvailability(checkov=False))
         monkeypatch.setattr(cli, "validate_yaml_file", lambda *a, **k: fake_result)
 
         with pytest.raises(SystemExit) as exited:
