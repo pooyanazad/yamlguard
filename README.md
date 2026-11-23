@@ -121,16 +121,18 @@ Syntax errors are Critical. Lint errors are Medium and warnings are Low, so **li
 ## Latest release
 
 <!-- RELEASE_NOTES_START -->
-### v3.5.1-20261011 — 2026-10-11
+### v3.5.2-20261123 — 2026-11-23
 
-**Changes since `v3.5.0-20261011`** (7 non-merge commits).
+**Changes since `v3.5.1-20261011`** (32 non-merge commits).
 
-- Build and maintenance: 2 commit(s).
-- Fixes: 3 commit(s).
-- Documentation: 2 commit(s).
+- `--no-security` skips Checkov startup and scanning. Syntax and yamllint checks still run.
+- Python callers can set `ToolAvailability(yamllint=False)` to skip linting and see that skip in the validation result.
+- Validation reports show which tools completed, skipped, or failed. When yamllint or Checkov fails to produce usable results, the CLI exits with an error.
+- Empty, comment-only, and null-only documents remain syntactically valid. Unreadable, undecodable, and binary inputs fail validation and skip downstream checks.
+- YAML file discovery skips symbolic links.
 
-[Full changelog](https://github.com/pooyanazad/yamlguard/compare/v3.5.0-20261011...v3.5.1-20261011)
+[Full changelog](https://github.com/pooyanazad/yamlguard/compare/v3.5.1-20261011...v3.5.2-20261123)
 
-**Docker image:** `pooyanazad/yamlguard:v3.5.1-20261011`
+**Docker image:** `pooyanazad/yamlguard:v3.5.2-20261123`
 
 <!-- RELEASE_NOTES_END -->
