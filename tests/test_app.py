@@ -33,6 +33,7 @@ from app import (
     validate_yaml_file,
     validate_yaml_syntax,
 )
+from yamlguard.models import ToolExecution, ToolStatus
 from yamlguard.validators import (
     LARGE_FILE_WARNING_THRESHOLD,
     warn_if_large_file,
@@ -733,19 +734,24 @@ class TestValidateYamlFile:
 
         mock_run_checkov.assert_called_once_with(clean_file, timeout=300)
 
-    def test_yamllint_false_only_runs_syntax_and_security(self, tmp_yaml):
-        """When tools.yamllint=False, validate_yaml_file skips yamllint."""
-        # A file that has trailing-space linting issues but valid syntax
+    def test_yamllint_false_only_runs_syntax_and_security(self, tmp_yaml, capsys):
         path = tmp_yaml("key: value   \n")
-        try:
-            tools = ToolAvailability(yamllint=False, checkov=False)
+        tools = ToolAvailability(yamllint=False)
+        with (
+            patch("yamlguard.validators.run_yamllint") as lint,
+            patch("yamlguard.validators.run_checkov", return_value=[]) as security,
+        ):
             result = validate_yaml_file(path, tools)
-            # yamllint disabled — but run_yamllint is still called by validate_yaml_file;
-            # ToolAvailability.yamllint only gates check_dependencies exit behaviour.
-            # This test confirms the result type is still correct.
-            assert isinstance(result, ValidationResult)
-        finally:
-            os.unlink(path)
+
+        lint.assert_not_called()
+        security.assert_called_once_with(path, timeout=300)
+        assert result.syntax_valid is True
+        assert result.issues == []
+        assert result.tool_status == [
+            ToolExecution("yamllint", ToolStatus.SKIPPED, "yamllint disabled or unavailable"),
+            ToolExecution("checkov", ToolStatus.COMPLETED),
+        ]
+        assert "Linting skipped (yamllint disabled or unavailable)" in capsys.readouterr().out
 
 
 class TestLargeFileWarning:
@@ -1236,6 +1242,25 @@ class TestCheckDependenciesMocked:
         assert result.checkov is True
 
     # ── yamllint missing ────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("flags", [[], ["--no-security"]])
+    def test_cli_requires_yamllint(self, flags, clean_file, capsys):
+        def fake_run(command, **kwargs):
+            if command[1:3] == ["-m", "yamllint"]:
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            patch.object(sys, "argv", ["yamlguard", *flags, clean_file]),
+            patch("subprocess.run", side_effect=fake_run),
+            patch("yamlguard.cli.validate_yaml_file") as validate,
+            pytest.raises(SystemExit) as exited,
+        ):
+            validator.main()
+
+        assert exited.value.code == 1
+        validate.assert_not_called()
+        assert "Missing required tools: yamllint" in capsys.readouterr().out
 
     def test_yamllint_missing_raises_sys_exit(self):
         """Missing yamllint causes sys.exit(1) (it is a required tool)."""

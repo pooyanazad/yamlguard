@@ -601,6 +601,23 @@ def _syntax_stage_valid(syntax_issues: list[ValidationIssue], say) -> bool:
     return True
 
 
+def _run_yamllint_stage(
+    file_path: str, timeout: int, say
+) -> tuple[list[ValidationIssue], ToolExecution]:
+    """Run yamllint and report the outcome of the lint stage."""
+    say("\n🔧 Running yamllint...", Severity.INFO)
+    issues = run_yamllint(file_path, timeout=timeout)
+    execution = _tool_execution("yamllint", issues)
+
+    if execution.failed:
+        say("❌ yamllint did not complete", Severity.HIGH)
+    elif issues:
+        say(f"⚠️  Found {len(issues)} linting issues", Severity.MEDIUM)
+    else:
+        say("✅ No linting issues found", Severity.INFO)
+    return issues, execution
+
+
 def validate_yaml_file(
     file_path: str,
     tools: ToolAvailability | None = None,
@@ -612,13 +629,13 @@ def validate_yaml_file(
 
     Informational syntax findings (such as empty or null-only documents) keep
     ``syntax_valid=True``. Readable files with YAML syntax errors mark
-    ``syntax_valid=False`` while still running yamllint (and Checkov when
-    enabled). Unreadable, undecodable, and binary files mark
-    ``syntax_valid=False`` and skip downstream scans.
+    ``syntax_valid=False`` while still running enabled tools. Unreadable,
+    undecodable, and binary files mark ``syntax_valid=False`` and skip
+    downstream scans.
 
     Args:
         file_path:   Path to the YAML file to validate.
-        tools:       Which external tools are available (probed automatically if None).
+        tools:       Which external tools are available (assumed available if None).
         timeout:     Subprocess timeout in seconds.
         no_security: Skip Checkov security checks.
         quiet:       Suppress all progress output (used in JSON mode so stdout stays clean).
@@ -655,17 +672,14 @@ def validate_yaml_file(
     syntax_valid = _syntax_stage_valid(syntax_issues, _say)
 
     # 2. Run yamllint
-    _say("\n🔧 Running yamllint...", Severity.INFO)
-    yamllint_issues = run_yamllint(file_path, timeout=timeout)
-    all_issues.extend(yamllint_issues)
-    tool_status.append(_tool_execution("yamllint", yamllint_issues))
-
-    if tool_status[-1].failed:
-        _say("❌ yamllint did not complete", Severity.HIGH)
-    elif yamllint_issues:
-        _say(f"⚠️  Found {len(yamllint_issues)} linting issues", Severity.MEDIUM)
+    if tools.yamllint:
+        yamllint_issues, execution = _run_yamllint_stage(file_path, timeout, _say)
+        all_issues.extend(yamllint_issues)
     else:
-        _say("✅ No linting issues found", Severity.INFO)
+        reason = "yamllint disabled or unavailable"
+        execution = ToolExecution("yamllint", ToolStatus.SKIPPED, reason)
+        _say(f"\n⚠️  Linting skipped ({reason})", Severity.MEDIUM)
+    tool_status.append(execution)
 
     # 3. Run checkov (if available)
     checkov_skip = _skipped_checkov(no_security, tools)
